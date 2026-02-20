@@ -1,12 +1,17 @@
-# Node
+# dependencies
 node_modules/
+
+# env
+.env
+.env.*
+
+# logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Env
-.env
-
-# OS
+# OS / editor
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
