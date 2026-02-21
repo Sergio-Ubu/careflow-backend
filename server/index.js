@@ -2,79 +2,89 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 
+import { route } from "./agents/router.js";
+import { solve } from "./agents/solver.js";
+import { review } from "./agents/reviewer.js";
+
+import {
+  appendMessage,
+  getContext,
+  getState,
+  setState,
+  getMeta,
+  setMeta,
+} from "./memory/sessionStore.js";
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Agente 1: Orchestrator (intención + riesgo)
-function detectIntent(text) {
-  const t = (text || "").toLowerCase();
-  if (t.includes("pedido") || t.includes("seguimiento") || t.includes("tracking") || t.includes("llega"))
-    return "tracking";
-  if (t.includes("devol") || t.includes("reembolso") || t.includes("refund"))
-    return "returns";
-  if (t.includes("garant") || t.includes("warranty"))
-    return "warranty";
-  if (t.includes("contraseña") || t.includes("password") || t.includes("login"))
-    return "account";
-  return "general";
-}
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { message, sessionId } = req.body || {};
+    if (!message) return res.status(400).json({ error: "Missing message" });
 
-function detectRisk(text) {
-  const t = (text || "").toLowerCase();
-  const angrySignals = [
-    "estafa", "denuncia", "fatal", "vergüenza", "inútil", "nadie me responde", "enfad", "cabre"
-  ];
-  if (angrySignals.some(w => t.includes(w))) return "high";
-  if (t.length > 220) return "medium";
-  return "low";
-}
+    const sid = sessionId || "demo";
 
-// Agente 2: Resolver (MVP)
-function resolverReply(intent) {
-  const replies = {
-    tracking: "Te ayudo con el seguimiento. Pásame número de pedido y email de compra y lo reviso.",
-    returns: "Perfecto, gestionamos la devolución. ¿Cuándo lo recibiste y el producto está sin usar?",
-    warranty: "Sobre garantía: dime el producto y la fecha de compra y te indico el proceso.",
-    account: "Entendido. ¿Quieres recuperar contraseña o tienes la cuenta bloqueada?",
-    general: "Cuéntame el problema con detalle y te guío paso a paso."
-  };
-  return replies[intent] || replies.general;
-}
+    // 1) Guardamos el mensaje del usuario
+    appendMessage(sid, "user", message);
 
-// Agente 3: Escalation / Handoff
-function makeTicket() {
-  return "T-" + Math.random().toString(36).slice(2, 8).toUpperCase();
-}
+    // 2) Cargamos contexto y estado
+    const context = getContext(sid); // últimos mensajes
+    const state = getState(sid);     // estado conversacional
+    const meta = getMeta(sid);       // datos extra (email, orderId, etc.)
 
-app.post("/api/chat", (req, res) => {
-  const { message, sessionId } = req.body || {};
-  if (!message) return res.status(400).json({ error: "Missing message" });
+    // 3) AGENTE 1 — ROUTER (intención + riesgo + acción)
+    const routing = route({ message, context, state, meta });
 
-  const intent = detectIntent(message);
-  const risk = detectRisk(message);
-
-  // Regla MVP: si riesgo alto -> handoff
-  if (risk === "high") {
-    const ticketId = makeTicket();
-    return res.json({
-      type: "handoff",
-      ticketId,
-      sessionId: sessionId || "demo",
-      intent,
-      risk,
-      summary: "Cliente con señales de frustración. Requiere intervención humana.",
-      suggestedReply: "Siento la experiencia. Voy a revisar tu caso ahora mismo y darte una solución clara.",
-      reply: `Entiendo tu frustración. Para resolverlo bien, te paso con un agente humano. Ticket: ${ticketId}.`
+    // 4) AGENTE 2 — SOLVER (resuelve + pide lo que falta + usa herramientas)
+    const solved = await solve({
+      intent: routing.intent,
+      action: routing.action,
+      message,
+      context,
+      state,
+      meta,
     });
-  }
 
-  return res.json({
-    type: "answer",
-    intent,
-    risk,
-    reply: resolverReply(intent)
-  });
+    // Persistimos estado y meta para multi-turn real
+    setState(sid, solved.nextState);
+    setMeta(sid, solved.nextMeta);
+
+    // 5) AGENTE 3 — REVIEWER (tono, seguridad, handoff si procede)
+    const checked = review({
+      draftReply: solved.reply,
+      intent: routing.intent,
+      risk: routing.risk,
+      action: routing.action,
+      meta: solved.nextMeta,
+    });
+
+    // Guardamos respuesta final
+    appendMessage(sid, "assistant", checked.finalReply);
+
+    // Ticket si handoff
+    let ticketId = null;
+    if (checked.type === "handoff") {
+      ticketId = "T-" + Math.random().toString(36).slice(2, 8).toUpperCase();
+    }
+
+    return res.json({
+      type: checked.type,
+      ticketId,
+      sessionId: sid,
+      intent: routing.intent,
+      risk: routing.risk,
+      summary: checked.summary,
+      reply: checked.finalReply,
+      // útil para demo (puedes ocultarlo luego):
+      state: solved.nextState,
+      meta: solved.nextMeta,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "internal_error" });
+  }
 });
 
 app.get("/health", (_, res) => res.send("ok"));
